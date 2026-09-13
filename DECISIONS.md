@@ -1,36 +1,18 @@
-# Architecture Decisions
+# Architectural Decision Records (ADR) - Milestone 1
 
-## STAGE 0 analysis
+## ADR 001: Separation of Concerns - Deterministic Expressive Spine vs Generative Layer
+- **Status**: Accepted
+- **Context**: Generative text-to-audio and audio-to-audio models drift notes, simplify complex chords, and smooth deliberate syncopation toward common statistical modes.
+- **Decision**: All microtiming, swing, accentuation, dynamic phrase arcs, and anticipation are resolved symbolically on the MIDI sequence prior to invoking any audio endpoint. The deterministic output serves as the immutable ground truth for downstream scoring.
+- **Consequences**: Generative models are restricted to timbre, texture, and acoustic transfer. Restyle failures are detected via rhythmic and melodic divergence, triggering prompt/seed regeneration rather than post-generation alignment hacks.
 
-### Symbolic coordinate system
-Perform symbolic analysis primarily in MIDI ticks. Convert to seconds only where an absolute-time measurement is required, such as quantization tolerance.
+## ADR 002: Ensemble Rubato Isolation to Global Tempo Maps
+- **Status**: Accepted
+- **Context**: Independent, per-stem phrase-level time-stretching shifts chord hit points across stems, smearing transient coherence and breaking downbeat alignment.
+- **Decision**: Phrase-level rubato, ritardandi, and tempo lifts are exclusively authored into the global MIDI tempo map (`SetTempo` events). Track-level timing adjustments are restricted to local microtiming offsets and humanizing jitter ($\sigma \le 4\text{ ms}$).
+- **Consequences**: Stems rendered via SoundFonts or SFZ instruments maintain absolute rhythmic lock on downbeats across polyphonic arrangements.
 
-### Quantization grid
-The initial rhythmic grid is a 16th-note grid.
-
-### Quantization tolerance
-The initial target is 8 ms. This is an implementation choice, not a value specified by the project PDF.
-
-### Quantization classification
-An onset is considered within tolerance when its distance from the nearest grid position is <= the configured tolerance. The overall track classification is based on the fraction of onsets within tolerance. The initial classification threshold is 0.95.
-
-### Polyphony
-Polyphony mean is time-weighted over the track's active note duration. Maximum polyphony is the maximum number of simultaneously active notes.
-
-### Note density
-Note density is the number of note-on events beginning within each bar.
-
-### Onset profile
-The initial onset profile uses 16 subdivisions per bar. Original onsets are mapped to their nearest subdivision before histogramming. The profile is normalized so its values sum to approximately 1.
-
-### Velocity flatness
-The artifact records mean velocity, standard deviation, number of unique velocities, and a flat classification. The exact classification threshold remains an implementation decision to be validated with fixtures.
-
-### Meter changes
-The first meter event establishes the initial bar grid. A subsequent meter event starts a new meter regime at its event position. Pickup/anacrusis handling is not yet specified.
-
-### Analysis failures
-A successful analysis may contain an empty key/section result when no such feature is detected. A genuine processing failure should raise an error rather than silently emitting a partial artifact.
-
-### Scope
-This first implementation covers the deterministic symbolic-analysis spine. Key detection, chord analysis, section inference, and role classification require separate algorithm design before implementation.
+## ADR 003: Deterministic Content Addressing and Artifact Isolation
+- **Status**: Accepted
+- **Context**: Implicit cross-DAG in-memory caching leaks transient state, complicating reproducible experiment tracking and budget audits.
+- **Decision**: All stage boundaries produce deterministic on-disk files accompanied by a JSON sidecar. The sidecar contains SHA-256 digests of upstream inputs, configurations, runtime manifests, and bar-boundary mappings.

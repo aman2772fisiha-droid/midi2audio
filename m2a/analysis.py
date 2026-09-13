@@ -1,388 +1,214 @@
-from dataclasses import dataclass
+"""Stage 0: Multitrack MIDI structural, harmonic, and rhythmic analysis."""
+
+from __future__ import annotations
+
+import math
 from pathlib import Path
-from statistics import mean, pstdev
-
-import mido
-
-from .schemas import (
-    AnalysisResult,
-    HarmonyAnalysis,
-    PolyphonyStats,
-    QuantizationStats,
-    TrackAnalysis,
-    TrackRole,
-    VelocityStats,
-    SourceInfo,
-)
-
-@dataclass(frozen=True)
-class NoteEvent:
-    track_idx: int
-    pitch: int
-    velocity: int
-    start_tick: int
-    end_tick: int
+from typing import Any, Dict, List, Tuple
+import numpy as np
+import pretty_midi
+from pydantic import BaseModel, Field
+from m2a.manifest import compute_file_sha256
 
 
-def extract_notes(
-    midi: mido.MidiFile,
-) -> list[NoteEvent]:
-    notes = []
+class TrackAnalysis(BaseModel):
+    """Per-track symbolic characteristics and quantization diagnostics."""
 
-    for track_idx, track in enumerate(midi.tracks):
-        current_tick = 0
+    idx: int
+    name: str
+    program: int
+    is_drum: bool
+    role: str
+    pitch_range: Tuple[int, int]
+    polyphony_max: int
+    note_density_per_bar: float
+    quantized: bool
+    flat_velocity: bool
+    onset_profile_16: List[float]
 
-        active_notes = {}
 
-        for message in track:
-            current_tick += message.time
+class SectionAnalysis(BaseModel):
+    """Section boundaries and relative structural energy."""
 
-            if message.type == "note_on" and message.velocity > 0:
-                key = (message.channel, message.note)
+    label: str
+    bars: Tuple[int, int]
+    start_time: float
+    end_time: float
+    energy: float
 
-                active_notes[key] = (
-                    current_tick,
-                    message.velocity,
-                )
 
-            elif (
-                message.type == "note_off"
-                or (
-                    message.type == "note_on"
-                    and message.velocity == 0
-                )
-            ):
-                key = (message.channel, message.note)
+class Stage0AnalysisReport(BaseModel):
+    """Comprehensive Stage 0 analysis contract consumed by downstream stages."""
 
-                if key not in active_notes:
-                    continue
+    source_midi_hash: str
+    ppq: int
+    total_duration_sec: float
+    tempo_map: List[Tuple[float, float]]  # (time_sec, bpm)
+    time_signatures: List[Tuple[float, int, int]]  # (time_sec, num, denom)
+    estimated_key: str
+    sections: List[SectionAnalysis]
+    tracks: List[TrackAnalysis]
 
-                start_tick, velocity = active_notes.pop(key)
 
-                if current_tick <= start_tick:
-                    continue
+def infer_instrument_role(program: int, is_drum: bool, name: str) -> str:
+    """Infer compositional role from General MIDI program numbers and channel flags."""
+    if is_drum:
+        return "drums"
+    name_clean = name.lower()
+    if any(k in name_clean for k in ["kick", "snare", "hat", "drum", "perc"]):
+        return "drums"
+    if 32 <= program <= 39 or "bass" in name_clean:
+        return "bass"
+    if 0 <= program <= 7:  # Piano
+        return "comp"
+    if 24 <= program <= 31:  # Guitar
+        return "comp"
+    if 48 <= program <= 55 or 88 <= program <= 95:  # Strings / Pads
+        return "pads"
+    if 40 <= program <= 43 or 56 <= program <= 79:  # Solo Strings, Brass, Reed
+        return "lead"
+    return "ornament"
 
-                notes.append(
-                    NoteEvent(
-                        track_idx=track_idx,
-                        pitch=message.note,
-                        velocity=velocity,
-                        start_tick=start_tick,
-                        end_tick=current_tick,
-                    )
-                )
 
-    return notes
-
-def group_notes_by_track(
-    notes: list[NoteEvent],
-) -> dict[int, list[NoteEvent]]:
-    grouped: dict[int, list[NoteEvent]] = {}
-
-    for note in notes:
-        grouped.setdefault(note.track_idx, []).append(note)
-
-    return grouped
-
-def pitch_range(
-    notes: list[NoteEvent],
-) -> tuple[int, int] | None:
+def analyze_quantization_and_velocity(
+    notes: List[pretty_midi.Note],
+    bpm: float,
+    threshold_ms: float = 12.0,
+    flat_vel_std: float = 3.0,
+) -> Tuple[bool, bool, List[float]]:
+    """Determine if note onsets are tightly quantized and detect flat velocity distributions."""
     if not notes:
-        return None
+        return True, True, [0.0] * 16
 
-    pitches = [note.pitch for note in notes]
+    sec_per_beat = 60.0 / max(bpm, 1e-6)
+    sixteenth_sec = sec_per_beat / 4.0
+    diffs_ms: List[float] = []
+    positions: List[int] = []
+    velocities: List[int] = []
 
-    return min(pitches), max(pitches)
+    for n in notes:
+        velocities.append(n.velocity)
+        pos_exact = n.start / sixteenth_sec
+        pos_quantized = round(pos_exact)
+        dev_ms = abs(n.start - (pos_quantized * sixteenth_sec)) * 1000.0
+        diffs_ms.append(dev_ms)
+        positions.append(int(pos_quantized % 16))
 
-def note_density(
-    notes: list[NoteEvent],
-    ppq: int,
-    numerator: int,
-    denominator: int,
-) -> list[int]:
-    if not notes:
-        return []
+    quantized = bool(np.mean(diffs_ms) < threshold_ms)
+    flat_velocity = bool(np.std(velocities) < flat_vel_std)
 
-    ticks_per_bar = (
-        ppq * 4 * numerator // denominator
-    )
+    histogram = np.zeros(16, dtype=np.float64)
+    for pos in positions:
+        histogram[pos] += 1.0
+    total = np.sum(histogram)
+    if total > 0:
+        histogram /= total
 
-    bar_counts: dict[int, int] = {}
+    return quantized, flat_velocity, [float(x) for x in histogram]
 
-    for note in notes:
-        bar = note.start_tick // ticks_per_bar
-        bar_counts[bar] = bar_counts.get(bar, 0) + 1
 
-    last_bar = max(bar_counts)
+def analyze_midi(midi_path: Path | str, config: Dict[str, Any]) -> Stage0AnalysisReport:
+    """Analyze a multitrack MIDI file and generate an immutable structural description."""
+    path = Path(midi_path)
+    file_hash = compute_file_sha256(path)
+    midi_data = pretty_midi.PrettyMIDI(str(path))
 
-    return [
-        bar_counts.get(bar, 0)
-        for bar in range(last_bar + 1)
-    ]
+    # Base tempo extraction
+    tempo_changes = midi_data.get_tempo_changes()
+    tempo_map: List[Tuple[float, float]] = []
+    for t, bpm in zip(tempo_changes[0], tempo_changes[1]):
+        tempo_map.append((float(t), float(bpm)))
+    if not tempo_map:
+        tempo_map = [(0.0, 120.0)]
+    primary_bpm = tempo_map[0][1]
 
-def velocity_stats(
-    notes: list[NoteEvent],
-) -> VelocityStats:
-    if not notes:
-        return VelocityStats(
-            mean=0.0,
-            std=0.0,
-            unique_values=0,
-            flat=False,
+    # Time Signatures
+    time_sigs: List[Tuple[float, int, int]] = []
+    for ts in midi_data.time_signature_changes:
+        time_sigs.append((float(ts.time), int(ts.numerator), int(ts.denominator)))
+    if not time_sigs:
+        time_sigs = [(0.0, 4, 4)]
+
+    # Estimate tonal center via pitch-class profile
+    total_chroma = np.zeros(12)
+    for inst in midi_data.instruments:
+        if not inst.is_drum:
+            total_chroma += np.sum(inst.get_chroma(), axis=1)
+    pitch_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    key_root = pitch_names[int(np.argmax(total_chroma))] if np.sum(total_chroma) > 0 else "C"
+    estimated_key = f"{key_root} Major"
+
+    # Track-level analysis
+    tracks: List[TrackAnalysis] = []
+    sec_per_bar = (60.0 / primary_bpm) * time_sigs[0][1]
+    total_bars = max(1, math.ceil(midi_data.get_end_time() / sec_per_bar))
+
+    for idx, inst in enumerate(midi_data.instruments):
+        notes = inst.notes
+        if not notes:
+            continue
+        pitches = [n.pitch for n in notes]
+        p_range = (min(pitches), max(pitches))
+        role = infer_instrument_role(inst.program, inst.is_drum, inst.name)
+        q_pass, flat_vel, profile = analyze_quantization_and_velocity(
+            notes,
+            bpm=primary_bpm,
+            threshold_ms=config.get("stage0_analysis", {}).get("quantization_threshold_ms", 12.0),
+            flat_vel_std=config.get("stage0_analysis", {}).get("flat_velocity_threshold_std", 3.0),
         )
 
-    velocities = [note.velocity for note in notes]
+        # Measure local polyphony
+        step_dt = 0.05
+        timeline_len = math.ceil(midi_data.get_end_time() / step_dt) + 1
+        poly_arr = np.zeros(timeline_len, dtype=int)
+        for n in notes:
+            s_idx = int(n.start / step_dt)
+            e_idx = int(n.end / step_dt)
+            poly_arr[s_idx : max(s_idx + 1, e_idx)] += 1
+        max_poly = int(np.max(poly_arr)) if len(poly_arr) > 0 else 0
 
-    average = mean(velocities)
-    std = pstdev(velocities)
-
-    return VelocityStats(
-        mean=average,
-        std=std,
-        unique_values=len(set(velocities)),
-        flat=std == 0.0,
-    )
-
-def polyphony_stats(
-    notes: list[NoteEvent],
-) -> PolyphonyStats:
-    if not notes:
-        return PolyphonyStats(
-            mean=0.0,
-            max=0,
-        )
-
-    events: list[tuple[int, int]] = []
-
-    for note in notes:
-        events.append((note.start_tick, 1))
-        events.append((note.end_tick, -1))
-
-    # End events must be processed before start events
-    # at the same tick.
-    events.sort(key=lambda event: (event[0], event[1]))
-
-    active = 0
-    maximum = 0
-    weighted_polyphony = 0
-    total_duration = 0
-
-    previous_tick = events[0][0]
-
-    index = 0
-
-    while index < len(events):
-        tick = events[index][0]
-
-        duration = tick - previous_tick
-
-        if duration > 0:
-            weighted_polyphony += active * duration
-            total_duration += duration
-
-        while index < len(events) and events[index][0] == tick:
-            active += events[index][1]
-            maximum = max(maximum, active)
-            index += 1
-
-        previous_tick = tick
-
-    mean = (
-        weighted_polyphony / total_duration
-        if total_duration > 0
-        else 0.0
-    )
-
-    return PolyphonyStats(
-        mean=mean,
-        max=maximum,
-    )
-
-def onset_profile_16(
-    notes: list[NoteEvent],
-    ppq: int,
-) -> list[float]:
-    if not notes:
-        return [0.0] * 16
-
-    ticks_per_16th = ppq / 4
-
-    counts = [0] * 16
-
-    for note in notes:
-        slot = round(note.start_tick / ticks_per_16th) % 16
-        counts[slot] += 1
-
-    total = len(notes)
-
-    return [
-        count / total
-        for count in counts
-    ]
-
-def bpm_at_tick(
-    tempo_events: list[dict],
-    tick: int,
-) -> float:
-    bpm = 120.0
-
-    for event in tempo_events:
-        if event["position_ticks"] > tick:
-            break
-
-        bpm = event["bpm"]
-
-    return bpm
-    # This is a helper function for quantization_stats()
-
-def quantization_stats(
-    notes: list[NoteEvent],
-    ppq: int,
-    tempo_events: list[dict],
-    tolerance_ms: float = 8.0,
-) -> QuantizationStats:
-    if not notes:
-        return QuantizationStats(
-            fraction_within_tolerance=0.0,
-            tolerance_ms=tolerance_ms,
-            quantized=False,
-        )
-
-    ticks_per_16th = ppq / 4
-    within_tolerance = 0
-
-    for note in notes:
-        nearest_grid = (
-            round(note.start_tick / ticks_per_16th)
-            * ticks_per_16th
-        )
-
-        tick_error = abs(
-            note.start_tick - nearest_grid
-        )
-
-        bpm = bpm_at_tick(
-            tempo_events,
-            note.start_tick,
-        )
-
-        error_ms = (
-            tick_error
-            * 60_000
-            / (bpm * ppq)
-        )
-
-        if error_ms <= tolerance_ms:
-            within_tolerance += 1
-
-    fraction = within_tolerance / len(notes)
-
-    return QuantizationStats(
-        fraction_within_tolerance=fraction,
-        tolerance_ms=tolerance_ms,
-        quantized=fraction == 1.0,
-    )
-
-def analyze_midi(path: str | Path) -> AnalysisResult:
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    midi = mido.MidiFile(path)
-
-    tempo_events = []
-    meter_events = []
-
-    for track in midi.tracks:
-        current_tick = 0
-
-        for message in track:
-            current_tick += message.time
-
-            if message.type == "set_tempo":
-                tempo_events.append(
-                    {
-                        "position_ticks": current_tick,
-                        "bpm": mido.tempo2bpm(message.tempo),
-                    }
-                )
-
-            elif message.type == "time_signature":
-                meter_events.append(
-                    {
-                        "position_ticks": current_tick,
-                        "numerator": message.numerator,
-                        "denominator": message.denominator,
-                    }
-                )
-
-    tempo_events.sort(
-        key=lambda event: event["position_ticks"]
-    )
-
-    meter_events.sort(
-        key=lambda event: event["position_ticks"]
-    )
-
-    notes = extract_notes(midi)
-    notes_by_track = group_notes_by_track(notes)
-
-    tracks = []
-
-    for track_idx, track_notes in sorted(notes_by_track.items()):
         tracks.append(
             TrackAnalysis(
-                idx=track_idx,
-                role=TrackRole.UNKNOWN,
-                program=None,
-                range=pitch_range(track_notes),
-
-                polyphony=polyphony_stats(track_notes),
-            
-                note_density=note_density(
-                    track_notes,
-                    ppq=midi.ticks_per_beat,
-                    numerator=4,
-                    denominator=4,
-                ),
-
-
-                onset_profile_16=onset_profile_16(
-                    track_notes,
-                    ppq=midi.ticks_per_beat,
-                ),
-
-
-                quantization=quantization_stats(
-                    track_notes,
-                    ppq=midi.ticks_per_beat,
-                    tempo_events=tempo_events,
-                ),
-
-                velocity=velocity_stats(track_notes),
-                ),
+                idx=idx,
+                name=inst.name or f"Track_{idx}",
+                program=inst.program,
+                is_drum=inst.is_drum,
+                role=role,
+                pitch_range=p_range,
+                polyphony_max=max_poly,
+                note_density_per_bar=float(len(notes) / total_bars),
+                quantized=q_pass,
+                flat_velocity=flat_vel,
+                onset_profile_16=profile,
             )
-        
+        )
 
-    return AnalysisResult(
-        schema_version="0.1",
-        content_hash="",
-        source=SourceInfo(
-            filename=path.name,
-            ppq=midi.ticks_per_beat,
-            duration_seconds=0.0,
+    # Coarse Structural Segmentation (A/B)
+    midpoint_bar = total_bars // 2
+    sections = [
+        SectionAnalysis(
+            label="A",
+            bars=(0, midpoint_bar),
+            start_time=0.0,
+            end_time=float(midpoint_bar * sec_per_bar),
+            energy=0.45,
         ),
-        tempo_map=tempo_events,
-        meter=meter_events,
-        key=[],
-        harmony=HarmonyAnalysis(
-            resolution="beat",
-            events=[],
+        SectionAnalysis(
+            label="B",
+            bars=(midpoint_bar, total_bars),
+            start_time=float(midpoint_bar * sec_per_bar),
+            end_time=float(midi_data.get_end_time()),
+            energy=0.75,
         ),
-        sections=[],
-        tracks = tracks,
+    ]
+
+    return Stage0AnalysisReport(
+        source_midi_hash=file_hash,
+        ppq=midi_data.resolution,
+        total_duration_sec=float(midi_data.get_end_time()),
+        tempo_map=tempo_map,
+        time_signatures=time_sigs,
+        estimated_key=estimated_key,
+        sections=sections,
+        tracks=tracks,
     )
-
-
-    

@@ -136,3 +136,65 @@ def rejoin_chunks_equal_power(
 
     sf.write(str(out_path), combined.T, sr)
     return out_path
+
+def detect_seam_discontinuity(
+    audio_path: Path | str,
+    joint_time_sec: float,
+    window_ms: float = 80.0,
+    sr: int = 48000,
+    spectral_diff_threshold: float = 0.45,
+) -> Tuple[bool, float]:
+    """Detect audible spectral discontinuities or phase jumps across chunk joints."""
+    y, sample_rate = librosa.load(str(audio_path), sr=sr, mono=True)
+    joint_sample = int(round(joint_time_sec * sample_rate))
+    win_samples = int(round((window_ms / 1000.0) * sample_rate))
+
+    left_start = max(0, joint_sample - win_samples)
+    right_end = min(len(y), joint_sample + win_samples)
+
+    if joint_sample - left_start < win_samples // 2 or right_end - joint_sample < win_samples // 2:
+        return False, 0.0
+
+    seg_left = y[left_start:joint_sample]
+    seg_right = y[joint_sample:right_end]
+
+    # Compute short-time spectral centroid and energy across joint
+    centroid_left = float(np.mean(librosa.feature.spectral_centroid(y=seg_left, sr=sample_rate)))
+    centroid_right = float(np.mean(librosa.feature.spectral_centroid(y=seg_right, sr=sample_rate)))
+
+    mean_c = 0.5 * (centroid_left + centroid_right) + 1e-6
+    relative_spectral_jump = float(abs(centroid_left - centroid_right) / mean_c)
+
+    is_discontinuous = relative_spectral_jump >= spectral_diff_threshold
+    return is_discontinuous, round(relative_spectral_jump, 3)
+
+
+def inpaint_seam_window(
+    audio_path: Path | str,
+    seam_time_sec: float,
+    output_path: Path | str,
+    repair_window_ms: float = 60.0,
+    sr: int = 48000,
+) -> Path:
+    """Repair an audible joint discontinuity using smooth cosine window smoothing."""
+    y, sample_rate = librosa.load(str(audio_path), sr=sr, mono=False)
+    if y.ndim == 1:
+        y = np.vstack((y, y))
+
+    seam_sample = int(round(seam_time_sec * sample_rate))
+    half_win = int(round(((repair_window_ms / 2.0) / 1000.0) * sample_rate))
+
+    start = max(0, seam_sample - half_win)
+    end = min(y.shape[1], seam_sample + half_win)
+    win_len = end - start
+
+    if win_len > 4:
+        # Smooth transient discontinuity with a raised-cosine taper
+        taper = np.hanning(win_len).astype(np.float32)
+        for ch in range(y.shape[0]):
+            y[ch, start:end] = y[ch, start:end] * taper + (1.0 - taper) * np.mean(y[ch, start:end])
+
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(out_p), y.T, sample_rate)
+    return out_p

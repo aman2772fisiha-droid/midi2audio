@@ -1,12 +1,24 @@
+# Python artifacts
 __pycache__/
 *.py[cod]
-.pytest_cache/
+*$py.class
 *.egg-info/
-.venv/
-venv/
-env/
-.env
 dist/
 build/
+
+# Virtual Environments
+venv/
+.env
+
+# Testing & Cache
+.pytest_cache/
+.hypothesis/
+.cache/
+
+# Pipeline Artifacts & Rendered Audio
+artifacts/
 *.wav
 *.mp3
+
+# Secret API Keys
+.env*
